@@ -13,7 +13,7 @@
 //            to android/app/src/main/AndroidManifest.xml (needed in release builds)
 //   iOS:     add NSCameraUsageDescription to ios/Runner/Info.plist
 //
-// Reviews
+// Reviews (THIS IS THE EDIT I MADE)
 // -------
 // Open Food Facts has no reviews, and there is no free, open review source.
 // Reviews sit behind the `ReviewProvider` interface. The default provider
