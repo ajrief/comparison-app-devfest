@@ -1,31 +1,35 @@
-// NutriCompare — AI-powered nutrition & critical-review comparison (prototype)
+// NutriCompare — scan product barcodes and compare nutrition facts.
 //
-// Runs with the plain Flutter SDK (no extra packages) so it works as a live
-// demo immediately:  flutter create nutri_compare && replace lib/main.dart
+// How it works
+// ------------
+// A barcode (EAN-13 / UPC-A / ...) is only an ID number. It carries no
+// nutrition data. The app reads the number with the camera, then looks the
+// product up online in Open Food Facts (free, crowd-sourced database).
 //
-// DEMO vs. PRODUCTION
-// -------------------
-// Everything that would hit the network sits behind `RecognitionService`
-// (photo -> products) and the `Catalog` (product -> nutrition + reviews).
-// The demo implementation simulates the pipeline against a built-in sample
-// catalog (fictional brands) so the presentation is fast and reliable.
+// Setup
+// -----
+//   flutter pub add http mobile_scanner
+//   Android: add <uses-permission android:name="android.permission.INTERNET"/>
+//            to android/app/src/main/AndroidManifest.xml (needed in release builds)
+//   iOS:     add NSCameraUsageDescription to ios/Runner/Info.plist
 //
-// To go live, swap in:
-//   1. Photo capture:      `image_picker` (camera / gallery, multiple images)
-//   2. Product detection:  a vision model call (e.g. Claude vision) that
-//                          returns product names/brands + bounding boxes for
-//                          every item in the photo; fall back to barcode scan
-//   3. Nutrition data:     Open Food Facts API (free, barcode/name lookup)
-//   4. Reviews:            retailer review APIs / licensed review data, then
-//                          an LLM pass to tag themes and summarise complaints
+// Reviews
+// -------
+// Open Food Facts has no reviews, and there is no free, open review source.
+// Reviews sit behind the `ReviewProvider` interface. The default provider
+// returns nothing, and the Reviews tab says so. Plug in a licensed review
+// API there if you have one.
 //
-// Design principle: the app NEVER scores or ranks products. It shows facts,
-// differences and recurring concerns, and the user decides.
+// Design principle: the app NEVER scores or ranks products. It shows facts
+// and differences, and the user decides.
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:mobile_scanner/mobile_scanner.dart';
 
 void main() => runApp(const NutriCompareApp());
 
@@ -85,8 +89,8 @@ extension MetricInfo on Metric {
         Metric.sodium => Icons.grain,
       };
 
-  /// General daily reference amounts (adult, 2,000 kcal diet). Individual
-  /// needs differ — shown only as context, never as a verdict.
+  /// General daily reference amounts (adult, 2,000 kcal diet). Shown only as
+  /// context, never as a verdict.
   double get dailyReference => switch (this) {
         Metric.calories => 2000,
         Metric.sugar => 50,
@@ -96,27 +100,32 @@ extension MetricInfo on Metric {
 }
 
 class Nutrition {
-  /// Values per 100 g.
-  final double calories, sugar, fat, sodium;
-  final double servingGrams;
+  /// Values per 100 g. Null = not available in the database.
+  final double? calories, sugar, fat, sodium;
+  final double? servingGrams;
 
   const Nutrition({
-    required this.calories,
-    required this.sugar,
-    required this.fat,
-    required this.sodium,
-    required this.servingGrams,
+    this.calories,
+    this.sugar,
+    this.fat,
+    this.sodium,
+    this.servingGrams,
   });
 
-  double per100(Metric m) => switch (m) {
+  double? per100(Metric m) => switch (m) {
         Metric.calories => calories,
         Metric.sugar => sugar,
         Metric.fat => fat,
         Metric.sodium => sodium,
       };
 
-  double value(Metric m, {required bool perServing}) =>
-      perServing ? per100(m) * servingGrams / 100 : per100(m);
+  double? value(Metric m, {required bool perServing}) {
+    final v = per100(m);
+    if (v == null) return null;
+    if (!perServing) return v;
+    final s = servingGrams;
+    return s == null ? null : v * s / 100;
+  }
 }
 
 class Review {
@@ -136,40 +145,124 @@ class Review {
 }
 
 class Product {
-  final String id, name, brand, category, emoji;
-  final Color color;
+  final String barcode, name, brand, category;
+  final String? imageUrl, ingredients;
   final Nutrition nutrition;
-  final double avgRating;
-  final int ratingCount;
-  final List<Review> reviews;
+  Color color = Colors.teal;
+  double? avgRating;
+  int? ratingCount;
+  List<Review> reviews = [];
 
-  const Product({
-    required this.id,
+  Product({
+    required this.barcode,
     required this.name,
     required this.brand,
     required this.category,
-    required this.emoji,
-    required this.color,
     required this.nutrition,
-    required this.avgRating,
-    required this.ratingCount,
-    required this.reviews,
+    this.imageUrl,
+    this.ingredients,
   });
+
+  String get id => barcode;
 }
 
-class Detection {
-  final Product product;
-  final double confidence;
+const _palette = [
+  Color(0xFFE0A526),
+  Color(0xFF3F6FD1),
+  Color(0xFFD9692B),
+  Color(0xFF6BAA75),
+  Color(0xFF8D5A3B),
+  Color(0xFF9B59B6),
+];
 
-  /// Normalised bounding box (0..1) inside the source photo.
-  final Rect box;
+// ─────────────────────────────────────────────────────────────────────────────
+// Product lookup (Open Food Facts)
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const Detection(this.product, this.confidence, this.box);
+class LookupException implements Exception {
+  final String message;
+  LookupException(this.message);
+  @override
+  String toString() => message;
+}
+
+class OpenFoodFactsService {
+  static const _fields =
+      'code,product_name,brands,categories,image_front_small_url,ingredients_text,'
+      'nutriments,serving_quantity';
+
+  /// Returns null when the barcode is not in the database.
+  Future<Product?> lookup(String barcode) async {
+    final uri = Uri.https(
+        'world.openfoodfacts.org', '/api/v2/product/$barcode.json', {'fields': _fields});
+    final http.Response res;
+    try {
+      res = await http
+          .get(uri, headers: {'User-Agent': 'NutriCompare/1.0 (flutter app)'})
+          .timeout(const Duration(seconds: 12));
+    } on TimeoutException {
+      throw LookupException('The lookup timed out. Check your connection.');
+    } catch (_) {
+      throw LookupException('Could not reach the product database. Are you online?');
+    }
+    if (res.statusCode == 404) return null;
+    if (res.statusCode != 200) {
+      throw LookupException('Product database error (${res.statusCode}).');
+    }
+    final json = jsonDecode(res.body) as Map<String, dynamic>;
+    if (json['status'] != 1) return null;
+    final p = json['product'] as Map<String, dynamic>;
+    final n = (p['nutriments'] as Map<String, dynamic>?) ?? {};
+
+    double? num_(dynamic v) => v is num ? v.toDouble() : double.tryParse('$v');
+
+    double? kcal = num_(n['energy-kcal_100g']);
+    kcal ??= num_(n['energy_100g']) == null ? null : num_(n['energy_100g'])! / 4.184;
+
+    // Sodium is reported in grams; fall back to salt (sodium = salt / 2.5).
+    double? sodiumMg;
+    final sodiumG = num_(n['sodium_100g']);
+    final saltG = num_(n['salt_100g']);
+    if (sodiumG != null) {
+      sodiumMg = sodiumG * 1000;
+    } else if (saltG != null) {
+      sodiumMg = saltG * 400;
+    }
+
+    String clean(dynamic v) => (v as String?)?.trim() ?? '';
+    final name = clean(p['product_name']);
+    final cats = clean(p['categories']);
+
+    return Product(
+      barcode: barcode,
+      name: name.isEmpty ? 'Unnamed product ($barcode)' : name,
+      brand: clean(p['brands']).split(',').first.trim(),
+      category: cats.isEmpty ? 'Food' : cats.split(',').last.trim(),
+      imageUrl: p['image_front_small_url'] as String?,
+      ingredients: clean(p['ingredients_text']).isEmpty ? null : clean(p['ingredients_text']),
+      nutrition: Nutrition(
+        calories: kcal,
+        sugar: num_(n['sugars_100g']),
+        fat: num_(n['fat_100g']),
+        sodium: sodiumMg,
+        servingGrams: num_(p['serving_quantity']),
+      ),
+    );
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Review analysis (theme counts, helpful-first ordering, cross-product matrix)
+// Reviews (plug in a licensed source here)
 // ─────────────────────────────────────────────────────────────────────────────
+
+abstract class ReviewProvider {
+  Future<List<Review>> reviewsFor(Product p);
+}
+
+class NoReviewProvider implements ReviewProvider {
+  @override
+  Future<List<Review>> reviewsFor(Product p) async => const [];
+}
 
 class ThemeStat {
   final String theme;
@@ -183,7 +276,6 @@ class ReviewAnalyzer {
   static List<Review> critical(Product p) =>
       p.reviews.where((r) => r.stars <= 3).toList();
 
-  /// Most helpful critical reviews first, optionally filtered by theme.
   static List<Review> helpful(Product p, {String? theme}) {
     final list = critical(p)
         .where((r) => theme == null || r.themes.contains(theme))
@@ -200,11 +292,10 @@ class ReviewAnalyzer {
         counts[t] = (counts[t] ?? 0) + 1;
       }
     }
-    final stats = counts.entries
+    return counts.entries
         .map((e) => ThemeStat(e.key, e.value, e.value / crit.length))
         .toList()
       ..sort((a, b) => b.count.compareTo(a.count));
-    return stats;
   }
 
   static double share(Product p, String theme) {
@@ -213,7 +304,6 @@ class ReviewAnalyzer {
     return crit.where((r) => r.themes.contains(theme)).length / crit.length;
   }
 
-  /// Themes across all products, most common overall first.
   static List<String> allThemes(List<Product> ps) {
     final counts = <String, int>{};
     for (final p in ps) {
@@ -221,18 +311,15 @@ class ReviewAnalyzer {
         counts[s.theme] = (counts[s.theme] ?? 0) + s.count;
       }
     }
-    final keys = counts.keys.toList()
-      ..sort((a, b) => counts[b]!.compareTo(counts[a]!));
-    return keys;
+    return counts.keys.toList()..sort((a, b) => counts[b]!.compareTo(counts[a]!));
   }
 
   static String summary(Product p) {
     final t = themes(p);
     final n = critical(p).length;
     if (t.isEmpty) return 'No recurring complaints found.';
-    final first = t.first;
     final base =
-        'Among $n critical reviews, "${first.theme}" comes up most (${first.count}).';
+        'Among $n critical reviews, "${t.first.theme}" comes up most (${t.first.count}).';
     if (t.length > 1 && t[1].count > 1) {
       return '$base "${t[1].theme}" is also mentioned repeatedly (${t[1].count}).';
     }
@@ -241,188 +328,11 @@ class ReviewAnalyzer {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Recognition service (demo implementation — swap for a real vision pipeline)
-// ─────────────────────────────────────────────────────────────────────────────
-
-abstract class RecognitionService {
-  /// One photo containing several products.
-  Future<List<Detection>> recognizeShelf({required void Function(String) onStage});
-
-  /// One photo of a single product. Returns null if nothing new is available.
-  Future<Detection?> recognizeSingle({
-    required Set<String> exclude,
-    required void Function(String) onStage,
-  });
-}
-
-class DemoRecognitionService implements RecognitionService {
-  int _shelfRun = 0;
-
-  static const _shelves = [
-    ['granola', 'spread', 'protein'],
-    ['protein', 'chips', 'yogurt'],
-    ['granola', 'chips', 'yogurt'],
-  ];
-
-  static const _boxes = [
-    Rect.fromLTWH(0.05, 0.18, 0.26, 0.62),
-    Rect.fromLTWH(0.37, 0.18, 0.26, 0.62),
-    Rect.fromLTWH(0.69, 0.18, 0.26, 0.62),
-  ];
-
-  Future<void> _stages(List<String> stages, void Function(String) cb) async {
-    for (final s in stages) {
-      cb(s);
-      await Future.delayed(const Duration(milliseconds: 650));
-    }
-  }
-
-  @override
-  Future<List<Detection>> recognizeShelf(
-      {required void Function(String) onStage}) async {
-    await _stages([
-      'Analysing photo…',
-      'Detecting products…',
-      'Matching labels & barcodes…',
-      'Fetching nutrition facts…',
-      'Searching critical reviews…',
-    ], onStage);
-    final ids = _shelves[_shelfRun++ % _shelves.length];
-    final rng = math.Random(_shelfRun);
-    return [
-      for (var i = 0; i < ids.length; i++)
-        Detection(Catalog.byId(ids[i]), 0.90 + rng.nextDouble() * 0.08, _boxes[i]),
-    ];
-  }
-
-  @override
-  Future<Detection?> recognizeSingle({
-    required Set<String> exclude,
-    required void Function(String) onStage,
-  }) async {
-    await _stages([
-      'Reading product photo…',
-      'Matching product…',
-      'Fetching nutrition & reviews…',
-    ], onStage);
-    final remaining =
-        Catalog.all.where((p) => !exclude.contains(p.id)).toList();
-    if (remaining.isEmpty) return null;
-    return Detection(remaining.first, 0.95, const Rect.fromLTWH(0.2, 0.1, 0.6, 0.8));
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Sample catalog (fictional brands, illustrative data)
-// ─────────────────────────────────────────────────────────────────────────────
-
-class Catalog {
-  static Product byId(String id) => all.firstWhere((p) => p.id == id);
-
-  static final List<Product> all = [
-    const Product(
-      id: 'granola',
-      name: 'Oat & Honey Bar',
-      brand: 'Harvest Crumb',
-      category: 'Snack bar',
-      emoji: '🌾',
-      color: Color(0xFFE0A526),
-      nutrition: Nutrition(calories: 430, sugar: 24, fat: 14, sodium: 180, servingGrams: 40),
-      avgRating: 4.1,
-      ratingCount: 3820,
-      reviews: [
-        Review(stars: 2, title: 'Way sweeter than it looks', body: 'Tastes like candy, not oats. Could not finish a whole bar.', helpful: 142, themes: ['Too sweet']),
-        Review(stars: 2, title: 'Smaller than it used to be', body: 'The bar seems noticeably smaller and the price went up.', helpful: 121, themes: ['Price', 'Smaller portions']),
-        Review(stars: 3, title: 'Falls apart in my bag', body: 'Crumbles everywhere unless you eat it very carefully.', helpful: 87, themes: ['Texture', 'Packaging']),
-        Review(stars: 1, title: 'Sticks to your teeth', body: 'Very sticky and sugary, not a good option before a meeting.', helpful: 64, themes: ['Texture', 'Too sweet']),
-        Review(stars: 3, title: 'Not filling', body: 'I was hungry again within an hour.', helpful: 51, themes: ['Not filling']),
-        Review(stars: 5, title: 'Great on hikes', body: 'Tasty and easy to carry.', helpful: 30, themes: []),
-      ],
-    ),
-    const Product(
-      id: 'spread',
-      name: 'Cocoa Hazelnut Spread',
-      brand: 'Velvet Nut Co.',
-      category: 'Spread',
-      emoji: '🍫',
-      color: Color(0xFF8D5A3B),
-      nutrition: Nutrition(calories: 540, sugar: 56, fat: 31, sodium: 40, servingGrams: 15),
-      avgRating: 4.5,
-      ratingCount: 9210,
-      reviews: [
-        Review(stars: 2, title: 'Mostly sugar', body: 'Sugar is the first ingredient. It is dessert, not breakfast.', helpful: 210, themes: ['Too sweet', 'Ingredient concerns']),
-        Review(stars: 1, title: 'Oil separates', body: 'A layer of oil on top every time, and the bottom is hard.', helpful: 96, themes: ['Texture']),
-        Review(stars: 3, title: 'Jar is half empty', body: 'Thick glass and a deep jar make it look like more than it is.', helpful: 73, themes: ['Packaging', 'Price']),
-        Review(stars: 3, title: 'Expensive for the amount', body: 'Gets used up quickly and costs a lot per spoonful.', helpful: 66, themes: ['Price']),
-        Review(stars: 2, title: 'Odd aftertaste', body: 'The flavour changed from the older recipe, a bit artificial now.', helpful: 58, themes: ['Artificial aftertaste']),
-        Review(stars: 5, title: 'Love it', body: 'Perfect on toast.', helpful: 12, themes: []),
-      ],
-    ),
-    const Product(
-      id: 'protein',
-      name: 'Protein Crunch Bar',
-      brand: 'PeakFuel',
-      category: 'Snack bar',
-      emoji: '💪',
-      color: Color(0xFF3F6FD1),
-      nutrition: Nutrition(calories: 370, sugar: 6, fat: 12, sodium: 290, servingGrams: 60),
-      avgRating: 3.9,
-      ratingCount: 5470,
-      reviews: [
-        Review(stars: 2, title: 'Chalky and dry', body: 'Powdery texture, needs a lot of water to get it down.', helpful: 188, themes: ['Texture', 'Artificial aftertaste']),
-        Review(stars: 2, title: 'Upset my stomach', body: 'Bloating after eating two. Probably the sugar alcohols.', helpful: 134, themes: ['Digestive issues']),
-        Review(stars: 3, title: 'Sweetener aftertaste', body: 'Lingering artificial sweetness, plus a little gas.', helpful: 101, themes: ['Artificial aftertaste', 'Digestive issues']),
-        Review(stars: 3, title: 'Very hard to chew', body: 'Gets rock hard in cold weather.', helpful: 92, themes: ['Texture']),
-        Review(stars: 1, title: 'Pricey for a snack', body: 'The cost per bar adds up quickly.', helpful: 77, themes: ['Price']),
-        Review(stars: 4, title: 'Good post-workout', body: 'Does what it says.', helpful: 25, themes: []),
-      ],
-    ),
-    const Product(
-      id: 'chips',
-      name: 'Salted Kettle Chips',
-      brand: 'Crisp & Co.',
-      category: 'Chips',
-      emoji: '🥔',
-      color: Color(0xFFD9692B),
-      nutrition: Nutrition(calories: 520, sugar: 1, fat: 33, sodium: 620, servingGrams: 28),
-      avgRating: 4.3,
-      ratingCount: 12040,
-      reviews: [
-        Review(stars: 2, title: 'Salt overload', body: 'Intensely salty, I was thirsty for hours.', helpful: 175, themes: ['Too salty']),
-        Review(stars: 3, title: 'Bag is mostly air', body: 'Half-full bag for the price, and the chips are small.', helpful: 140, themes: ['Packaging', 'Price', 'Smaller portions']),
-        Review(stars: 3, title: 'Mostly crumbs', body: 'The bottom third of the bag was dust.', helpful: 112, themes: ['Packaging', 'Texture']),
-        Review(stars: 2, title: 'Greasy', body: 'Oil on my fingers and on the bag.', helpful: 90, themes: ['Greasy']),
-        Review(stars: 2, title: 'Batches vary', body: 'Some bags are perfect, others taste stale.', helpful: 48, themes: ['Quality inconsistency']),
-        Review(stars: 5, title: 'Super crunchy', body: 'Best kettle chips I have tried.', helpful: 40, themes: []),
-      ],
-    ),
-    const Product(
-      id: 'yogurt',
-      name: 'Creamy Greek Yogurt',
-      brand: 'Meadowlane',
-      category: 'Dairy',
-      emoji: '🥛',
-      color: Color(0xFF6BAA75),
-      nutrition: Nutrition(calories: 97, sugar: 4, fat: 5, sodium: 36, servingGrams: 150),
-      avgRating: 4.2,
-      ratingCount: 2760,
-      reviews: [
-        Review(stars: 3, title: 'Quite sour', body: 'More tangy than other brands, needs a sweetener.', helpful: 83, themes: ['Too sour']),
-        Review(stars: 2, title: 'Watery', body: 'Liquid on top and thinner than expected for Greek yogurt.', helpful: 120, themes: ['Texture']),
-        Review(stars: 2, title: 'Price per cup', body: 'More expensive than comparable tubs.', helpful: 69, themes: ['Price']),
-        Review(stars: 3, title: 'Short shelf life', body: 'Expiry date arrives fast, one tub was off early.', helpful: 57, themes: ['Quality inconsistency']),
-        Review(stars: 3, title: 'Tub cracks', body: 'The plastic lid cracked in two of four tubs.', helpful: 44, themes: ['Packaging']),
-        Review(stars: 5, title: 'Creamy and mild', body: 'Great with fruit.', helpful: 19, themes: []),
-      ],
-    ),
-  ];
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-String fmt(double v) {
+String fmt(double? v) {
+  if (v == null) return '–';
   if (v >= 100) return v.round().toString();
   final s = v.toStringAsFixed(1);
   return s.endsWith('.0') ? s.substring(0, s.length - 2) : s;
@@ -443,8 +353,114 @@ class Stars extends StatelessWidget {
       );
 }
 
+class ProductThumb extends StatelessWidget {
+  final Product product;
+  final double size;
+  const ProductThumb(this.product, {super.key, this.size = 44});
+
+  @override
+  Widget build(BuildContext context) {
+    final url = product.imageUrl;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        width: size,
+        height: size,
+        color: product.color.withValues(alpha: 0.2),
+        child: url == null
+            ? Icon(Icons.shopping_bag_outlined, color: product.color)
+            : Image.network(url,
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) =>
+                    Icon(Icons.shopping_bag_outlined, color: product.color)),
+      ),
+    );
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Home: capture / recognise products
+// Barcode scanner screen
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ScannerScreen extends StatefulWidget {
+  const ScannerScreen({super.key});
+
+  @override
+  State<ScannerScreen> createState() => _ScannerScreenState();
+}
+
+class _ScannerScreenState extends State<ScannerScreen> {
+  final _controller = MobileScannerController(
+    formats: const [
+      BarcodeFormat.ean13,
+      BarcodeFormat.ean8,
+      BarcodeFormat.upcA,
+      BarcodeFormat.upcE,
+    ],
+    detectionSpeed: DetectionSpeed.noDuplicates,
+  );
+  bool _done = false;
+
+  void _onDetect(BarcodeCapture capture) {
+    if (_done) return;
+    final code = capture.barcodes.map((b) => b.rawValue).whereType<String>().firstOrNull;
+    if (code == null || code.isEmpty) return;
+    _done = true;
+    Navigator.of(context).pop(code);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        title: const Text('Scan a barcode'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.flash_on),
+            tooltip: 'Toggle torch',
+            onPressed: () => _controller.toggleTorch(),
+          ),
+        ],
+      ),
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          MobileScanner(controller: _controller, onDetect: _onDetect),
+          Center(
+            child: Container(
+              width: 280,
+              height: 160,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.white, width: 3),
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+          ),
+          const Positioned(
+            left: 0,
+            right: 0,
+            bottom: 48,
+            child: Text(
+              'Line up the barcode inside the frame',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Home: scan / add products
 // ─────────────────────────────────────────────────────────────────────────────
 
 class HomeScreen extends StatefulWidget {
@@ -455,264 +471,205 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  final RecognitionService _service = DemoRecognitionService();
-  final List<Detection> _items = [];
-  List<Detection> _shelf = [];
+  final _off = OpenFoodFactsService();
+  final ReviewProvider _reviews = NoReviewProvider();
+  final List<Product> _items = [];
   bool _busy = false;
-  String _stage = '';
 
-  void _addIfNew(Detection d) {
-    if (!_items.any((e) => e.product.id == d.product.id)) _items.add(d);
-  }
-
-  Future<void> _scanShelf() async {
-    setState(() {
-      _busy = true;
-      _stage = 'Preparing photo…';
-    });
-    final result = await _service.recognizeShelf(onStage: (s) {
-      if (mounted) setState(() => _stage = s);
-    });
+  void _toast(String msg) {
     if (!mounted) return;
-    setState(() {
-      _busy = false;
-      _shelf = result;
-      for (final d in result) {
-        _addIfNew(d);
-      }
-    });
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  Future<void> _addSingle() async {
-    setState(() {
-      _busy = true;
-      _stage = 'Preparing photo…';
-    });
-    final d = await _service.recognizeSingle(
-      exclude: _items.map((e) => e.product.id).toSet(),
-      onStage: (s) {
-        if (mounted) setState(() => _stage = s);
-      },
+  Future<void> _scan() async {
+    final code = await Navigator.of(context)
+        .push<String>(MaterialPageRoute(builder: (_) => const ScannerScreen()));
+    if (code != null) await _addBarcode(code);
+  }
+
+  Future<void> _enterManually() async {
+    final controller = TextEditingController();
+    final code = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Enter barcode'),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.number,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'e.g. 5449000000996'),
+          onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+              child: const Text('Look up')),
+        ],
+      ),
     );
-    if (!mounted) return;
-    setState(() {
-      _busy = false;
-      if (d != null) _addIfNew(d);
-    });
-    if (d == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('All demo products are already added.')),
-      );
+    if (code != null && code.isNotEmpty) await _addBarcode(code);
+  }
+
+  Future<void> _addBarcode(String code) async {
+    if (_items.any((p) => p.barcode == code)) {
+      _toast('That product is already added.');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final p = await _off.lookup(code);
+      if (!mounted) return;
+      if (p == null) {
+        _toast('Barcode $code was not found in Open Food Facts.');
+      } else {
+        p.color = _palette[_items.length % _palette.length];
+        try {
+          p.reviews = await _reviews.reviewsFor(p);
+        } catch (_) {
+          // Reviews are optional; nutrition still works without them.
+        }
+        if (!mounted) return;
+        setState(() => _items.add(p));
+      }
+    } on LookupException catch (e) {
+      _toast(e.message);
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
-  void _remove(Detection d) => setState(() {
-        _items.remove(d);
-        _shelf = _shelf.where((e) => e.product.id != d.product.id).toList();
-      });
+  void _remove(Product p) => setState(() => _items.remove(p));
 
   void _openCompare() {
     Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => CompareScreen(products: _items.map((e) => e.product).toList()),
+      builder: (_) => CompareScreen(products: List.of(_items)),
     ));
   }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final canCompare = _items.length >= 2 && !_busy;
     return Scaffold(
       appBar: AppBar(
         title: const Text('NutriCompare', style: TextStyle(fontWeight: FontWeight.w700)),
         centerTitle: false,
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _items.length >= 2 && !_busy ? _openCompare : null,
+        onPressed: canCompare ? _openCompare : null,
         icon: const Icon(Icons.compare_arrows),
         label: Text(_items.length >= 2
             ? 'Compare ${_items.length} products'
-            : 'Add at least 2 products'),
-        backgroundColor: _items.length >= 2 ? cs.primary : cs.surfaceContainerHighest,
-        foregroundColor: _items.length >= 2 ? cs.onPrimary : cs.onSurfaceVariant,
+            : 'Scan at least 2 products'),
+        backgroundColor: canCompare ? cs.primary : cs.surfaceContainerHighest,
+        foregroundColor: canCompare ? cs.onPrimary : cs.onSurfaceVariant,
       ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
         children: [
           Text('Compare what you\'re about to buy',
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700)),
+              style: Theme.of(context)
+                  .textTheme
+                  .headlineSmall
+                  ?.copyWith(fontWeight: FontWeight.w700)),
           const SizedBox(height: 6),
           Text(
-            'Photograph several products at once, or add them one by one. '
-            'We show nutrition and what critical reviewers say — you decide.',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: cs.onSurfaceVariant),
+            'Scan each product\'s barcode. We look up its nutrition facts and '
+            'show them side by side — you decide.',
+            style: Theme.of(context)
+                .textTheme
+                .bodyMedium
+                ?.copyWith(color: cs.onSurfaceVariant),
           ),
           const SizedBox(height: 16),
           Row(
             children: [
               Expanded(
                 child: FilledButton.icon(
-                  onPressed: _busy ? null : _scanShelf,
-                  icon: const Icon(Icons.photo_camera_outlined),
-                  label: const Text('Photo of several'),
+                  onPressed: _busy ? null : _scan,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('Scan barcode'),
                 ),
               ),
               const SizedBox(width: 10),
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: _busy ? null : _addSingle,
-                  icon: const Icon(Icons.add_a_photo_outlined),
-                  label: const Text('Add one product'),
+                  onPressed: _busy ? null : _enterManually,
+                  icon: const Icon(Icons.keyboard_outlined),
+                  label: const Text('Type number'),
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 14),
-          AnimatedSwitcher(
-            duration: const Duration(milliseconds: 250),
-            child: _busy
-                ? Card(
-                    key: const ValueKey('busy'),
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(_stage, style: const TextStyle(fontWeight: FontWeight.w600)),
-                          const SizedBox(height: 10),
-                          const LinearProgressIndicator(),
-                        ],
-                      ),
-                    ),
-                  )
-                : _shelf.isNotEmpty
-                    ? ShelfPreview(key: const ValueKey('shelf'), detections: _shelf)
-                    : const SizedBox.shrink(key: ValueKey('none')),
-          ),
+          if (_busy) ...[
+            const SizedBox(height: 14),
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Looking up product…', style: TextStyle(fontWeight: FontWeight.w600)),
+                    SizedBox(height: 10),
+                    LinearProgressIndicator(),
+                  ],
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 16),
           if (_items.isEmpty)
-            _EmptyState(color: cs.onSurfaceVariant)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 36),
+              child: Column(
+                children: [
+                  Icon(Icons.shopping_basket_outlined,
+                      size: 56, color: cs.onSurfaceVariant.withValues(alpha: 0.6)),
+                  const SizedBox(height: 10),
+                  Text('No products yet', style: TextStyle(color: cs.onSurfaceVariant)),
+                ],
+              ),
+            )
           else ...[
-            Text('Recognised products (${_items.length})',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+            Text('Scanned products (${_items.length})',
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
-            for (final d in _items)
+            for (final p in _items)
               Card(
                 margin: const EdgeInsets.only(bottom: 8),
                 child: ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor: d.product.color.withValues(alpha: 0.2),
-                    child: Text(d.product.emoji, style: const TextStyle(fontSize: 22)),
-                  ),
-                  title: Text(d.product.name, style: const TextStyle(fontWeight: FontWeight.w600)),
+                  leading: ProductThumb(p),
+                  title: Text(p.name,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w600)),
                   subtitle: Text(
-                      '${d.product.brand} · ${d.product.category} · ${(d.confidence * 100).round()}% match'),
+                      [if (p.brand.isNotEmpty) p.brand, p.category, p.barcode].join(' · '),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
                   trailing: IconButton(
                     icon: const Icon(Icons.close),
                     tooltip: 'Remove',
-                    onPressed: () => _remove(d),
+                    onPressed: () => _remove(p),
                   ),
                 ),
               ),
           ],
           const SizedBox(height: 12),
           Text(
-            'Demo mode: products, nutrition and reviews come from a built-in sample catalog.',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+            'Nutrition data: Open Food Facts (crowd-sourced, may be incomplete or out of date).',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: cs.onSurfaceVariant),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _EmptyState extends StatelessWidget {
-  final Color color;
-  const _EmptyState({required this.color});
-
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 36),
-        child: Column(
-          children: [
-            Icon(Icons.shopping_basket_outlined, size: 56, color: color.withValues(alpha: 0.6)),
-            const SizedBox(height: 10),
-            Text('No products yet', style: TextStyle(color: color)),
-          ],
-        ),
-      );
-}
-
-/// Simulated "photo" with detection boxes drawn over each recognised product.
-class ShelfPreview extends StatelessWidget {
-  final List<Detection> detections;
-  const ShelfPreview({super.key, required this.detections});
-
-  @override
-  Widget build(BuildContext context) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(16),
-      child: AspectRatio(
-        aspectRatio: 16 / 10,
-        child: LayoutBuilder(builder: (context, c) {
-          return Container(
-            decoration: const BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [Color(0xFFEFE7DA), Color(0xFFD9CBB4)],
-              ),
-            ),
-            child: Stack(
-              children: [
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  bottom: c.maxHeight * 0.16,
-                  child: Container(height: 8, color: const Color(0xFF9C8566)),
-                ),
-                for (final d in detections)
-                  Positioned.fromRect(
-                    rect: Rect.fromLTWH(
-                      d.box.left * c.maxWidth,
-                      d.box.top * c.maxHeight,
-                      d.box.width * c.maxWidth,
-                      d.box.height * c.maxHeight,
-                    ),
-                    child: Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(color: d.product.color, width: 2.5),
-                        borderRadius: BorderRadius.circular(10),
-                        color: d.product.color.withValues(alpha: 0.12),
-                      ),
-                      child: Stack(
-                        children: [
-                          Center(child: Text(d.product.emoji, style: const TextStyle(fontSize: 38))),
-                          Positioned(
-                            left: 0,
-                            right: 0,
-                            top: 0,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                              decoration: BoxDecoration(
-                                color: d.product.color,
-                                borderRadius: const BorderRadius.vertical(top: Radius.circular(7)),
-                              ),
-                              child: Text(
-                                d.product.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                    color: Colors.white, fontSize: 10, fontWeight: FontWeight.w600),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          );
-        }),
       ),
     );
   }
@@ -758,10 +715,9 @@ class _CompareScreenState extends State<CompareScreen> {
     );
   }
 
-  // ── Nutrition tab ──────────────────────────────────────────────────────────
-
   Widget _buildNutritionTab(BuildContext context) {
     final visible = _visible;
+    final missingServing = visible.any((p) => p.nutrition.servingGrams == null);
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -772,7 +728,7 @@ class _CompareScreenState extends State<CompareScreen> {
             for (final p in widget.products)
               FilterChip(
                 avatar: CircleAvatar(backgroundColor: p.color, radius: 6),
-                label: Text('${p.emoji} ${p.name}'),
+                label: Text(p.name, overflow: TextOverflow.ellipsis),
                 selected: !_hidden.contains(p.id),
                 selectedColor: p.color.withValues(alpha: 0.22),
                 onSelected: (sel) => setState(() {
@@ -794,6 +750,14 @@ class _CompareScreenState extends State<CompareScreen> {
           selected: {_perServing},
           onSelectionChanged: (s) => setState(() => _perServing = s.first),
         ),
+        if (_perServing && missingServing)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              'Some products have no serving size in the database; they show "–" per serving.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
         const SizedBox(height: 14),
         _GroupedOverview(products: visible, perServing: _perServing),
         const SizedBox(height: 12),
@@ -802,27 +766,67 @@ class _CompareScreenState extends State<CompareScreen> {
         const SizedBox(height: 4),
         _SideBySideTable(products: visible, perServing: _perServing),
         const SizedBox(height: 12),
+        _IngredientsCard(products: visible),
+        const SizedBox(height: 12),
         const _NeutralityNote(),
       ],
     );
   }
 
-  // ── Reviews tab ────────────────────────────────────────────────────────────
-
   Widget _buildReviewsTab(BuildContext context) {
     final products = widget.products;
-    final themes = ReviewAnalyzer.allThemes(products);
     final cs = Theme.of(context).colorScheme;
+    final hasReviews = products.any((p) => p.reviews.isNotEmpty);
 
+    if (!hasReviews) {
+      return ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.rate_review_outlined, color: cs.primary, size: 32),
+                  const SizedBox(height: 10),
+                  Text('No review source connected',
+                      style: Theme.of(context)
+                          .textTheme
+                          .titleMedium
+                          ?.copyWith(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Open Food Facts covers nutrition, not customer reviews. '
+                    'To show critical reviews, connect a licensed review source '
+                    'through the ReviewProvider in the code.',
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          const _NeutralityNote(),
+        ],
+      );
+    }
+
+    final themes = ReviewAnalyzer.allThemes(products);
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
         Text('Recurring complaints across products',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+            style: Theme.of(context)
+                .textTheme
+                .titleMedium
+                ?.copyWith(fontWeight: FontWeight.w700)),
         const SizedBox(height: 4),
         Text(
           'Share of each product\'s critical reviews (3★ or lower) that mention the topic.',
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: cs.onSurfaceVariant),
         ),
         const SizedBox(height: 10),
         Card(
@@ -832,8 +836,7 @@ class _CompareScreenState extends State<CompareScreen> {
           ),
         ),
         const SizedBox(height: 14),
-        Text('Filter reviews by topic',
-            style: Theme.of(context).textTheme.labelLarge),
+        Text('Filter reviews by topic', style: Theme.of(context).textTheme.labelLarge),
         const SizedBox(height: 6),
         SizedBox(
           height: 44,
@@ -881,16 +884,11 @@ class _CompareScreenState extends State<CompareScreen> {
             for (final p in ps)
               Padding(
                 padding: const EdgeInsets.all(6),
-                child: Column(
-                  children: [
-                    Text(p.emoji, style: const TextStyle(fontSize: 22)),
-                    Text(p.name,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.center,
-                        style: Theme.of(context).textTheme.labelSmall),
-                  ],
-                ),
+                child: Text(p.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.labelSmall),
               ),
           ]),
           for (final t in themes)
@@ -927,8 +925,8 @@ class _CompareScreenState extends State<CompareScreen> {
 // Nutrition widgets
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Grouped column chart: one group per nutrient, one column per product.
-/// Columns are scaled within each nutrient so differences are easy to see.
+double _maxOf(Iterable<double?> vs) => vs.whereType<double>().fold<double>(0, math.max);
+
 class _GroupedOverview extends StatelessWidget {
   final List<Product> products;
   final bool perServing;
@@ -944,16 +942,19 @@ class _GroupedOverview extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text('Overview',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w700)),
             Text('Columns are scaled within each nutrient.',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: cs.onSurfaceVariant)),
             const SizedBox(height: 10),
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                for (final m in Metric.values)
-                  Expanded(child: _group(context, m)),
-              ],
+              children: [for (final m in Metric.values) Expanded(child: _group(context, m))],
             ),
           ],
         ),
@@ -965,7 +966,7 @@ class _GroupedOverview extends StatelessWidget {
     final values = {
       for (final p in products) p.id: p.nutrition.value(m, perServing: perServing)
     };
-    final maxV = values.values.fold<double>(0, math.max);
+    final maxV = _maxOf(values.values);
     final denom = maxV == 0 ? 1.0 : maxV;
     return Column(
       children: [
@@ -977,20 +978,23 @@ class _GroupedOverview extends StatelessWidget {
             children: [
               for (final p in products)
                 TweenAnimationBuilder<double>(
-                  tween: Tween(begin: 0, end: values[p.id]! / denom),
+                  tween: Tween(begin: 0, end: (values[p.id] ?? 0) / denom),
                   duration: const Duration(milliseconds: 700),
                   curve: Curves.easeOutCubic,
                   builder: (_, f, _) => Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text(fmt(values[p.id]!), style: const TextStyle(fontSize: 9)),
+                      Text(fmt(values[p.id]), style: const TextStyle(fontSize: 9)),
                       const SizedBox(height: 2),
                       Container(
                         width: 12,
                         height: math.max(3, 104 * f),
                         decoration: BoxDecoration(
-                          color: p.color,
-                          borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+                          color: values[p.id] == null
+                              ? Colors.grey.withValues(alpha: 0.3)
+                              : p.color,
+                          borderRadius:
+                              const BorderRadius.vertical(top: Radius.circular(4)),
                         ),
                       ),
                     ],
@@ -1002,18 +1006,19 @@ class _GroupedOverview extends StatelessWidget {
         const SizedBox(height: 6),
         Icon(m.icon, size: 16),
         Text(m.label, style: Theme.of(context).textTheme.labelSmall),
-        Text(m.unit, style: Theme.of(context).textTheme.labelSmall?.copyWith(color: Colors.grey)),
+        Text(m.unit,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(color: Colors.grey)),
       ],
     );
   }
 }
 
-/// Horizontal bar chart for one nutrient. Tap a bar for context.
 class _MetricCard extends StatefulWidget {
   final Metric metric;
   final List<Product> products;
   final bool perServing;
-  const _MetricCard({required this.metric, required this.products, required this.perServing});
+  const _MetricCard(
+      {required this.metric, required this.products, required this.perServing});
 
   @override
   State<_MetricCard> createState() => _MetricCardState();
@@ -1030,9 +1035,10 @@ class _MetricCardState extends State<_MetricCard> {
       for (final p in widget.products)
         p.id: p.nutrition.value(m, perServing: widget.perServing)
     };
-    final maxV = values.values.fold<double>(0, math.max);
+    final maxV = _maxOf(values.values);
     final denom = maxV == 0 ? 1.0 : maxV;
     final selected = widget.products.where((p) => p.id == _selected).toList();
+    final selValue = selected.isEmpty ? null : values[selected.first.id];
 
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
@@ -1046,10 +1052,16 @@ class _MetricCardState extends State<_MetricCard> {
                 Icon(m.icon, size: 20, color: cs.primary),
                 const SizedBox(width: 8),
                 Text(m.label,
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w700)),
                 const Spacer(),
                 Text(widget.perServing ? 'per serving' : 'per 100 g',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: cs.onSurfaceVariant)),
               ],
             ),
             const SizedBox(height: 10),
@@ -1063,17 +1075,18 @@ class _MetricCardState extends State<_MetricCard> {
                     children: [
                       SizedBox(
                         width: 104,
-                        child: Text('${p.emoji} ${p.name}',
+                        child: Text(p.name,
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
                               fontSize: 12,
-                              fontWeight: _selected == p.id ? FontWeight.w700 : FontWeight.w500,
+                              fontWeight:
+                                  _selected == p.id ? FontWeight.w700 : FontWeight.w500,
                             )),
                       ),
                       Expanded(
                         child: TweenAnimationBuilder<double>(
-                          tween: Tween(begin: 0, end: values[p.id]! / denom),
+                          tween: Tween(begin: 0, end: (values[p.id] ?? 0) / denom),
                           duration: const Duration(milliseconds: 600),
                           curve: Curves.easeOutCubic,
                           builder: (_, f, _) => Stack(
@@ -1086,28 +1099,31 @@ class _MetricCardState extends State<_MetricCard> {
                                   borderRadius: BorderRadius.circular(6),
                                 ),
                               ),
-                              FractionallySizedBox(
-                                widthFactor: f.clamp(0.02, 1.0),
-                                child: Container(
-                                  height: 18,
-                                  decoration: BoxDecoration(
-                                    color: p.color,
-                                    borderRadius: BorderRadius.circular(6),
-                                    border: _selected == p.id
-                                        ? Border.all(color: cs.onSurface, width: 1.5)
-                                        : null,
+                              if (values[p.id] != null)
+                                FractionallySizedBox(
+                                  widthFactor: f.clamp(0.02, 1.0),
+                                  child: Container(
+                                    height: 18,
+                                    decoration: BoxDecoration(
+                                      color: p.color,
+                                      borderRadius: BorderRadius.circular(6),
+                                      border: _selected == p.id
+                                          ? Border.all(color: cs.onSurface, width: 1.5)
+                                          : null,
+                                    ),
                                   ),
                                 ),
-                              ),
                             ],
                           ),
                         ),
                       ),
                       SizedBox(
                         width: 70,
-                        child: Text('${fmt(values[p.id]!)} ${m.unit}',
+                        child: Text(
+                            values[p.id] == null ? 'n/a' : '${fmt(values[p.id])} ${m.unit}',
                             textAlign: TextAlign.end,
-                            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+                            style: const TextStyle(
+                                fontWeight: FontWeight.w600, fontSize: 12)),
                       ),
                     ],
                   ),
@@ -1126,10 +1142,12 @@ class _MetricCardState extends State<_MetricCard> {
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: Text(
-                        '${selected.first.name}: ${fmt(values[selected.first.id]!)} ${m.unit} '
-                        '≈ ${(values[selected.first.id]! / m.dailyReference * 100).round()}% of the '
-                        '${fmt(m.dailyReference)} ${m.unit} general daily reference. '
-                        'Individual needs vary.',
+                        selValue == null
+                            ? '${selected.first.name}: no ${m.label.toLowerCase()} data in the database.'
+                            : '${selected.first.name}: ${fmt(selValue)} ${m.unit} '
+                                '≈ ${(selValue / m.dailyReference * 100).round()}% of the '
+                                '${fmt(m.dailyReference)} ${m.unit} general daily reference. '
+                                'Individual needs vary.',
                         style: const TextStyle(fontSize: 12),
                       ),
                     ),
@@ -1156,7 +1174,10 @@ class _SideBySideTable extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text('Side by side',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
             SingleChildScrollView(
               scrollDirection: Axis.horizontal,
@@ -1165,22 +1186,20 @@ class _SideBySideTable extends StatelessWidget {
                 columnWidths: const {0: FixedColumnWidth(92)},
                 defaultVerticalAlignment: TableCellVerticalAlignment.middle,
                 border: TableBorder(
-                  horizontalInside: BorderSide(color: cs.outlineVariant.withValues(alpha: 0.5)),
+                  horizontalInside:
+                      BorderSide(color: cs.outlineVariant.withValues(alpha: 0.5)),
                 ),
                 children: [
                   TableRow(children: [
                     const SizedBox(),
                     for (final p in products)
                       Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 8),
-                        child: Column(children: [
-                          Text(p.emoji, style: const TextStyle(fontSize: 22)),
-                          Text(p.name,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              textAlign: TextAlign.center,
-                              style: Theme.of(context).textTheme.labelSmall),
-                        ]),
+                        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
+                        child: Text(p.name,
+                            maxLines: 3,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.labelSmall),
                       ),
                   ]),
                   for (final m in Metric.values)
@@ -1188,7 +1207,8 @@ class _SideBySideTable extends StatelessWidget {
                       Padding(
                         padding: const EdgeInsets.symmetric(vertical: 10),
                         child: Text('${m.label} (${m.unit})',
-                            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
                       ),
                       for (final p in products)
                         Text(fmt(p.nutrition.value(m, perServing: perServing)),
@@ -1201,11 +1221,59 @@ class _SideBySideTable extends StatelessWidget {
                           style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12)),
                     ),
                     for (final p in products)
-                      Text('${fmt(p.nutrition.servingGrams)} g', textAlign: TextAlign.center),
+                      Text(
+                          p.nutrition.servingGrams == null
+                              ? '–'
+                              : '${fmt(p.nutrition.servingGrams)} g',
+                          textAlign: TextAlign.center),
                   ]),
                 ],
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _IngredientsCard extends StatelessWidget {
+  final List<Product> products;
+  const _IngredientsCard({required this.products});
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Ingredients',
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w700)),
+            const SizedBox(height: 8),
+            for (final p in products)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(children: [
+                      CircleAvatar(backgroundColor: p.color, radius: 5),
+                      const SizedBox(width: 6),
+                      Expanded(
+                          child: Text(p.name,
+                              style: const TextStyle(fontWeight: FontWeight.w600))),
+                    ]),
+                    const SizedBox(height: 2),
+                    Text(p.ingredients ?? 'No ingredient list in the database.',
+                        style: Theme.of(context).textTheme.bodySmall),
+                  ],
+                ),
+              ),
           ],
         ),
       ),
@@ -1227,6 +1295,9 @@ class _ProductReviewCard extends StatelessWidget {
     final cs = Theme.of(context).colorScheme;
     final stats = ReviewAnalyzer.themes(product);
     final reviews = ReviewAnalyzer.helpful(product, theme: themeFilter);
+    final rating = product.avgRating == null
+        ? ''
+        : ' · ${product.avgRating}★ avg · ${product.ratingCount ?? 0} ratings';
 
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
@@ -1237,56 +1308,60 @@ class _ProductReviewCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                CircleAvatar(
-                  backgroundColor: product.color.withValues(alpha: 0.2),
-                  child: Text(product.emoji, style: const TextStyle(fontSize: 20)),
-                ),
+                ProductThumb(product, size: 40),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(product.name, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
-                      Text(
-                        '${product.brand} · ${product.avgRating}★ avg · ${product.ratingCount} ratings',
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant),
-                      ),
+                      Text(product.name,
+                          style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+                      Text('${product.brand}$rating',
+                          style: Theme.of(context)
+                              .textTheme
+                              .bodySmall
+                              ?.copyWith(color: cs.onSurfaceVariant)),
                     ],
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 10),
-            Text(ReviewAnalyzer.summary(product)),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 6,
-              runSpacing: -4,
-              children: [
-                for (final s in stats)
-                  Chip(
-                    label: Text('${s.theme} · ${s.count}'),
-                    visualDensity: VisualDensity.compact,
-                    backgroundColor: themeFilter == s.theme
-                        ? product.color.withValues(alpha: 0.35)
-                        : product.color.withValues(alpha: 0.12),
-                    side: BorderSide.none,
-                  ),
-              ],
-            ),
-            const Divider(height: 24),
-            Text(
-              themeFilter == null
-                  ? 'Most helpful critical reviews'
-                  : 'Most helpful reviews mentioning "$themeFilter"',
-              style: Theme.of(context).textTheme.labelLarge,
-            ),
-            const SizedBox(height: 6),
-            if (reviews.isEmpty)
-              Text('No critical reviews mention this topic.',
+            if (product.reviews.isEmpty)
+              Text('No reviews available for this product.',
                   style: TextStyle(color: cs.onSurfaceVariant))
-            else
-              for (final r in reviews.take(3)) _ReviewTile(review: r, accent: product.color),
+            else ...[
+              Text(ReviewAnalyzer.summary(product)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 6,
+                runSpacing: -4,
+                children: [
+                  for (final s in stats)
+                    Chip(
+                      label: Text('${s.theme} · ${s.count}'),
+                      visualDensity: VisualDensity.compact,
+                      backgroundColor: themeFilter == s.theme
+                          ? product.color.withValues(alpha: 0.35)
+                          : product.color.withValues(alpha: 0.12),
+                      side: BorderSide.none,
+                    ),
+                ],
+              ),
+              const Divider(height: 24),
+              Text(
+                themeFilter == null
+                    ? 'Most helpful critical reviews'
+                    : 'Most helpful reviews mentioning "$themeFilter"',
+                style: Theme.of(context).textTheme.labelLarge,
+              ),
+              const SizedBox(height: 6),
+              if (reviews.isEmpty)
+                Text('No critical reviews mention this topic.',
+                    style: TextStyle(color: cs.onSurfaceVariant))
+              else
+                for (final r in reviews.take(3)) _ReviewTile(review: r, accent: product.color),
+            ],
           ],
         ),
       ),
@@ -1326,7 +1401,10 @@ class _ReviewTile extends StatelessWidget {
           Text(review.body),
           const SizedBox(height: 6),
           Text('👍 ${review.helpful} found this helpful',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(color: cs.onSurfaceVariant)),
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: cs.onSurfaceVariant)),
         ],
       ),
     );
